@@ -1,0 +1,238 @@
+#!/bin/bash
+
+##  Purpose:
+##      After forking and waiting a few seconds, unmounts all ZFS datasets belonging to users that:
+##          - Are logged out, and
+##          - Have ZFS encrypted home folders, and
+##          - Haven't yet been unmounted.
+##  Notes:
+##	- This doesn't seem to run too reliably as a systemd service, or lightdm script.
+##    Which isn't this script's fault, but probably more about how this author has tried to set up the service or lightdm script.
+##	  But is robust enough to run from cron, eg /etc/cron.hourly/ - and not mess with logged-in users.
+##  History:
+##      - 20201219 x9: Created.
+##      - 20201220 x9: Bug fixes and enhancements.
+##	- 20230112 x9: Minor improvements, big improvements to functionality.
+##	- 20230113 x9:
+##		- Added more information output via fuser and lsof.
+##		- Try gently killing only write processes first.
+##		- Try harder to unmount after killing stuff.
+##		- Initial list for loop now limited to 1) ZFS datasets, AND 2) that are mounted, AND 3) that are mounted under "/home".
+##		- Significantly improved error and conditions checking.
+##		- Abort if being run by current user.
+##		- Added user-friendly text string arg to fEchoAndDo().
+
+
+set -eu
+
+function fMain(){
+
+	local -i lastExitCode=0
+	local userName=""
+	local mountPoint=""
+	local loggedInUserList=""
+
+	## Since this may be running from cron or as a service, temporarily append basic paths just in case none are set.
+	export PATH="${PATH}/usr/lib/lightdm/lightdm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+	echo "$0"
+	echo "Started $(date "+%Y%m%d-%H%M%S")"
+
+	## Get list of 'rpool/USERDATA/*' ZFS datasets mounted at '/home/*'
+	local -r zfsHomeDatasets="$(mount | grep -iP " /home/.+" | grep -iP "^rpool/USERDATA/.+" | awk '{ print $1 }' || true)"
+	if [[ -z "${zfsHomeDatasets}" ]]; then
+		echo "❌ Error: There appears to be no 'rpool/USERDATA/*' ZFS datasets mounted at '/home/*'."
+		exit
+	fi
+
+	## Get list of logged in users
+	loggedInUserList="$(users)"
+	loggedInUserList="$(echo -e "${loggedInUserList//" "/"\n"}" | sort -u)"
+
+	## Loop through datasets
+	for zDataSet in ${zfsHomeDatasets}; do
+
+		echo -e "\n\n[ Checking /home ZFS dataset '${zDataSet}' ... ]"
+		echo "-------------------------------------------------------------------------------"
+
+		## Get FS mountpoint
+		mountPoint="$(zfs get all ${zDataSet} | grep -iP "mountpoint" | awk '{ print $3 }')"
+		if [[ -z "${mountPoint}" ]]; then
+			echo "❌ Error: Could not determine mountpoint for ZFS dataset '${zDataSet}'. May already be unmounted."
+			continue
+		fi
+		echo "• Mountpoint: '${mountPoint}'"
+
+		## Get username of the mountpoint
+		userName="$(getent passwd | grep "${mountPoint}" | cut -f1 -d: || true)"
+		if [[ -z "${userName}" ]]; then
+			echo "[ ❌ FYI: Could not determine username from mountpoint '${mountPoint}'. Skipping. ]"
+			continue
+		fi
+		echo "• Username: '${userName}'"
+
+		## Make sure the username isn't the one running this script
+		if [[ "${userName}" == "${USER}" ]] || [[ "${userName}" == "${SUDO_USER}" ]]; then
+			echo "❌ The target username '${userName}' is the one running this script, and my programming forbids me from forcefully killing your processes. Skipping."
+			continue
+		fi
+		echo "✔️ The target username '${userName}' is not the one running this script."
+
+		## Is user logged out?
+		if [[ -n "$(echo -e "${loggedInUserList}" | grep -iPo "^${userName}\$" 2>/dev/null || true)" ]]; then
+			echo "❌ User '${userName}' seems to be still logged in. Skipping."
+			continue
+		fi
+		echo "✔️ User '${userName}' seems to be logged out."
+
+		## Is ZFS dataset encrypted? The preferred method of getting ZFS property values is: `zfs get encryption ${zDataSet} -ovalue -H`, but it doesn't seem reliable, hence grep and awk.
+		if [[ -n "$(zfs get all ${zDataSet} | grep -iP "encryption[ ]+off" || true)" ]]; then
+			echo "❌ User ZFS dataset '${zDataSet}' in not encrypted, no point in unmounting, skipping."
+			continue
+		fi
+		echo "✔️ User ZFS dataset '${zDataSet}' is encrypted, therefore should be unmounted."
+
+		## Show info; fuser
+		echo -e "\nFYI - BEFORE: processes that have something open in '${mountPoint}':"
+
+		echo -e "\nfuser -uvM -m '${mountPoint}':"
+		fuser -uvM -m "$1" 2>/dev/null || true
+
+		echo -e "\n(lsof '${mountPoint}'):"
+		lsof "$1" 2>/dev/null || true
+
+		## Attempt 1/3 to unmount using a variety of ways
+		fUnmount_TryAllTheWays
+		if [[ $(fIsMounted "${mountPoint}") == "true" ]]; then
+
+			## Not unmounted yet. Gracefully close those processes with write access to mountpoint (silently).
+			sleep 3
+			fEchoAndDo "sudo fuser -15 -kswM -m '${mountPoint}'"  "Attempting to gracefully close processes with write access to anything at or below '${mountPoint}' ..."
+
+			## Attempt 2/3 to unmount using a variety of ways
+			fUnmount_TryAllTheWays
+			if [[ $(fIsMounted "${mountPoint}") == "true" ]]; then
+
+				## Still not unmounted yet. Forcefully and immediately KILL all processes with any kind of access to mountpoint.
+				sleep 3
+				fEchoAndDo "sudo fuser -9 -ksM -m '${mountPoint}'"  "Attempting to forcefully and immediately kill all processes accessing anythig at or below '${mountPoint}' ..."
+
+				## Attempt 3/3 to unmount using a variety of ways
+				fUnmount_TryAllTheWays
+				if [[ $(fIsMounted "${mountPoint}") == "true" ]]; then
+
+					## Punt, just pretend it's unmounted and hope processes let go of files.
+					fEchoAndDo "sudo umount -f --lazy --recursive '${mountPoint}'"  "Lazily and recursively unmounting '${mountPoint}' as a punt ..."
+					if [[ lastExitCode -ne 0 ]]; then
+						fEchoAndDo "sudo umount -f --lazy '${mountPoint}'"  "Lazily unmounting just '${mountPoint}' as a last-ditch punt ..."
+					fi
+
+				fi
+			fi
+		fi
+
+		if [[ $(fIsMounted "${mountPoint}") == "true" ]]; then
+			echo -e "\n❌ FAILURE: ZFS dataset '${zDataSet}' is still mounted at '${mountPoint}'."
+		else
+			echo -e "\n✔️ SUCCESS: ZFS dataset '${zDataSet}' is no longer mounted at '${mountPoint}'."
+		fi
+
+		## Try to unload the encryption key.
+		sleep 3
+		fEchoAndDo "sudo zfs unload-key ${zDataSet}"  "Attempting to unloading encryption key for  '${mountPoint}' ..."
+
+		## Show what has files/folders open under user's home folder [after].
+		sleep 3
+		echo -e "\nFYI - AFTER: Processes owned by '${userName}':"
+		sudo ps -u ${userName} 2>/dev/null || true
+
+	done
+
+	echo -e "\n\n[ Done. ]\n"
+
+}
+
+
+function fIsMounted(){
+	## Input either a ZFS dataset name, or it's mountpoint
+	local zfsDatasetOrMountpoint="$1"
+	local retVal="false"
+	[[ -n "$(mount | grep -iPo "(^| )${zfsDatasetOrMountpoint}( |\$)" || true)" ]] && retVal="true"
+	echo ${retVal}
+}
+
+
+function fUnmount_TryAllTheWays(){
+
+	[[ $(fIsMounted "${mountPoint}") == "false" ]] && return
+
+	## Try to unmount ZFS normally
+	sleep 3
+	fEchoAndDo "sudo zfs unmount ${zDataSet}"
+	[[ $(fIsMounted "${mountPoint}") == "false" ]] && return
+
+	## Try to recursively FS unmount (eg encfs, cifs)
+	sleep 3
+	fEchoAndDo "sudo umount --recursive ${mountPoint}"
+	[[ $(fIsMounted "${mountPoint}") == "false" ]] && return
+
+	## Try to recursively FS unmount (eg encfs, cifs), extra option
+	sleep 3
+	fEchoAndDo "sudo umount --recursive --all-targets ${mountPoint}"
+	[[ $(fIsMounted "${mountPoint}") == "false" ]] && return
+
+	## Get a little more forceful with native ZFS
+	sleep 3
+	fEchoAndDo "sudo zfs unmount -f ${zDataSet}"
+	[[ $(fIsMounted "${mountPoint}") == "false" ]] && return
+
+	## More forceful recursive FS unmount (eg encfs, cifs)
+	sleep 3
+	fEchoAndDo "sudo umount -f --recursive ${mountPoint}"
+	[[ $(fIsMounted "${mountPoint}") == "false" ]] && return
+
+	## More forceful recursive FS unmount (eg encfs, cifs), extra option
+	sleep 3
+	fEchoAndDo "sudo umount -f --recursive --all-targets ${mountPoint}"
+	[[ $(fIsMounted "${mountPoint}") == "false" ]] && return
+
+	## Try plain native FS way
+	sleep 3
+	fEchoAndDo "sudo umount ${mountPoint}"
+	[[ $(fIsMounted "${mountPoint}") == "false" ]] && return
+
+	## Try plain native FS way, more agressively
+	sleep 3
+	fEchoAndDo "sudo umount -f ${mountPoint}"
+	[[ $(fIsMounted "${mountPoint}") == "false" ]] && return
+
+}
+
+
+function fEchoAndDo(){
+	local -r cmdString="$1"
+	local -r optionalShowInfoFirst="$2"
+
+	echo
+	[[ -n "${optionalShowInfoFirst}" ]] && echo "[ ${optionalShowInfoFirst} ]"
+	echo "Executing: ${cmdString}"
+
+	set +e
+		eval "${cmdString}"
+		lastExitCode=$?
+		true
+	set -e
+
+}
+
+
+## Re-launch, forked to background and logging output.
+if [[ "$1" != "REENTRANT" ]]; then
+	if [[ ! -d "/var/log/$(basename "$0")" ]]; then mkdir "/var/log/$(basename "$0")"; fi
+	("$0" "REENTRANT" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" &> "/var/log/$(basename "$0")/$(basename "$0")-$(date "+%Y%m%d-%H%M%S").log") & disown
+else
+	shift || true
+	fMain "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"
+fi
+
+exit
