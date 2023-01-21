@@ -1,0 +1,152 @@
+#!/bin/bash
+
+##	Purpose:
+##		Mounts encrypted ZFS filesystem via PAM on user login.
+##		The ZFS properties that are required to be set are:
+##			- canmount=noauto
+##			- x9.custom.automount:user=username logging in (which PAM stuffs in $PAM_LOGIN).
+##	TODO:
+##		- awk can probably do what datamash is doing - without a non-POSIX tool.
+##	History:
+##		- 20221219 x9: Created.
+##		- 20221220 x9: Bug fixes.
+##		- 20230119 x9:
+##			- Stuffed inside a function for better variable scope/security.
+##			- More error and sanity checking.
+##			- More output for troubleshooting.
+
+
+set -eu
+
+function fMain(){
+
+	## User-defined property to query:
+	local -r custProp_UserName="x9.custom.automount:user"
+	#local -r custProp_Mountpoint="x9.custom.automount:dir"  ## May need this in the future
+
+	## Password is given to us via stdin, save it in a variable for later
+	echo
+	echo "[ If the script appears stuck here, it was probably expecting the password to be piped to it. CTRL+C and try agian. ]"
+	local -r userPwd=$(cat -)
+
+	## Variables
+	local mountLocation=""
+
+	echo
+	echo "Script ............: '${0}'"
+	echo "Started ...........: '$(date "+%Y%m%d-%H%M%S")'"
+	echo "custProp_UserName .......: '${custProp_UserName}'"
+	echo "PAM_USER ..........: '${PAM_USER}'"
+
+	## Trigger an error if a dependency is not installed
+	echo "which awk .........: '$(which awk)'"
+	echo "which datamash ....: '$(which datamash)'"
+	echo "which grep ........: '$(which grep)'"
+	echo "which head ........: '$(which head)'"
+	echo "which sort ........: '$(which sort)'"
+	echo "which uniq ........: '$(which uniq)'"
+	echo "which zfs .........: '$(which zfs)'"
+	echo
+
+	## Calculate the filesystem name to unlock.
+	## This is no less reliable than a loop - but much faste; as both require the the exact same properties to be in place, and have to make the exact same assumptions for corner cases. (Or if you want to make different assumptions, it can be just as easily done in a long pipe as a loop.)
+	local -r filesystemName="$(
+			## List all filesystems (not snapshots), along with their ${custProp_UserName} and canmount properties.
+			##   This will result in two lines per filesystem - one for each property. (A problem 'datamash' will solve later.)
+			zfs get -t filesystem ${custProp_UserName},canmount | 
+			## Filter potentially large result set down to just those with required combined attributes: (${custProp_UserName} AND right username AND local) OR (canmount AND noauto), which are on separate lines.
+			##   This may result in only two rows of the same filesystem whith the correct answer - but many perfectly valid corner cases exist that could make such an assumption wrong.
+			grep -P "${custProp_UserName}[ ]+${PAM_USER}[ ]+local|canmount[ ]+noauto" | 
+			## Jam the property fields together, so that the only space delimiter is between filesystem and properties
+			##   Result will look like: 'rpool/homez/jjose x9.custom.automount:user=jjose[local]'
+			awk '{print $1 " " $2 "=" $3 "[" $4 "]"}' | 
+			## Sort results by filesystem name and then property name, so we have predictable row and field orders after datamash
+			## Sorting is wildly incorrect without LC_ALL=C.
+			LC_ALL=C sort | 
+			## Make sure we're only dealing with uniques. ('-u' flag for sort doesn't do this as you'd expect.)
+			uniq |
+			## Collapse multiple rows of redundant filesystem names and unique field and values, to just one row per filesystem name.
+			##   Result will look like 'rpool/homez/jjose x9.custom.automount:user=jjose[local],canmount=noauto[local]'
+			datamash -W --output-delimiter=" " groupby 1 collapse 2 | 
+			## Get just the rows with 'canmount=noauto'
+			grep -P "( |,)canmount=noauto\[" | 
+			## Since the exact string for ${custProp_UserName} could change, and therefore we don't know if it will sort before or after 'canmount',
+			##   then filter for this separetely rather as part of the previous regex.
+			grep -P "( |,)${custProp_UserName}=${PAM_USER}\[local\]" | 
+			## Extract just the first field - the filesystem name. This is probably the one answer, but just in case for edge cases (eg sub-filesystems with same 'local' settingsa), 
+			##   keep going with these very low-risk manipulations, to further eliminate rare but valid corner cases.
+			##   Result will look like 'rpool/homez/jjose/var'
+			awk '{print $1}' | 
+			## Prepend the length of filesystem name, in character count, to the beginning of each line, in preparation for next step.
+			##   Result will look like '17 rpool/homez/jjose'
+			awk '{ print length, $0 }' | 
+			## Sort again, this time numerically by the first field (length of file system name), smallest number (filesystem name length) first.
+			##   This is for the corner cases where sub-filesystems might have matched so far, and we only want the parent - which by definition will have a shorter name.
+			sort -n | 
+			## Remove the line length field so now we're back to just the filesystem name - but now sorted by line length.
+			##   Lines of the same length were already sub-sorted alphabetically.
+			##   Now we're back down to just one field - filesystem name.
+			awk '{print $2}' | 
+			## Return the One True Answer.
+			head -n 1
+		)"
+
+	## Validate
+	if [[ -z "${filesystemName}" ]]; then
+		echo -e "❌ FYI in $(basename "${0}").${FUNCNAME[0]}(): The calculated \$filesystemName is empty. Probably because user '${PAM_USER}' doesn't have an encrypted ZFS filesystem that needs to be loaded for a home directory. But if so, make sure the custom property '${custProp_UserName}' is set to that username, and the 'canmount' property is set to 'noauto'."
+		exit 0
+	fi
+	echo "✔️ Determined that '${PAM_USER}'s ZFS filesystem is '${filesystemName}'."
+
+	## Get mount location
+	mountLocation="$(zfs get -H mountpoint ${filesystemName} | awk '{print $3}')"
+
+	## Validate
+	if [[ -z "${mountLocation}" ]]; then
+		echo -e "❌ Error in $(basename "${0}").${FUNCNAME[0]}(): Unable to determine mount location of '${filesystemName}' from its ZFS properties.\n"
+		exit 1
+	fi
+	echo "✔️ mountLocation = '${mountLocation}'"
+
+	if [[ "$(zfs get -H mounted ${filesystemName} | awk '{print $3}')" == "yes" ]]; then
+		echo -e "❌ Non-fatal warning in $(basename "${0}").${FUNCNAME[0]}(): ZFS says that filesystem '${filesystemName}' is already mounted."
+	else
+	echo "✔️ ZFS reports that the filesystem is not already mounted."
+
+		if [[ -n "$(ls -A "${mountLocation}" 2>/dev/null || true)" ]]; then
+			echo -e "❌ Error in $(basename "${0}").${FUNCNAME[0]}(): There is already stuff inside '${mountLocation}' (the mount location for '${filesystemName}').\n"
+			exit 1
+		fi
+		echo "✔️ The unmounted target mountpoint is empty: '${mountLocation}'."
+
+		## Load the key
+		echo "[ Attempting to load key for '${filesystemName}' ('Key already loaded' error is OK) ... ]"
+		zfs load-key "${filesystemName}" <<< "$userPwd" || true  ## Ignore errors
+
+		## Mount the filesystem
+		echo "[ Attempting mount '${filesystemName}' at '${mountLocation}' ... ]"
+		zfs mount "${filesystemName}"
+
+		if [[ "$(zfs get -H mounted ${filesystemName} | awk '{print $3}')" != "yes" ]]; then
+			echo -e "❌ Error in $(basename "${0}").${FUNCNAME[0]}(): ZFS filesystem '${filesystemName}' didn't error on mount, but does not report being mounted.\n"
+			exit 1
+		fi
+		echo "✔️ The filesystem was successfully mounted."
+
+	fi
+
+	## Validate
+	if [[ -z "$(ls -A "${mountLocation}" 2>/dev/null || true)" ]]; then
+		echo -e "❌ Error in $(basename "${0}").${FUNCNAME[0]}(): Nothing exists inside '${mountLocation}' (the mount location for '${filesystemName}').\n"
+		exit 1
+	fi
+	echo "✔️ The mount location '${mountLocation}' has stuff in it, mission accomplished."
+
+	echo
+	echo "[ Done. ]"
+	echo
+
+}
+
+
+fMain
